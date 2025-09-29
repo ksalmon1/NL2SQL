@@ -9,16 +9,18 @@ import mlflow
 load_dotenv()
 
 anthropic_api_key = os.getenv('anthropic_api_key')
+gcloud_toolbox = os.getenv('gcloud_toolbox')
+gcloud_bq_project = os.getenv('gcloud_bq_project')
 
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("DSPy")
 mlflow.dspy.autolog()
 
 # Create server parameters for stdio connection
-server_params = StdioServerParameters(
-    command="C:\\Users\\Kenny\\dspy_playground\\toolbox.exe",
+server_params = StdioServerParameters( 
+    command=gcloud_toolbox,
     args=["--prebuilt","bigquery","--stdio"],
-    env={"BIGQUERY_PROJECT": "deep-circuits"}
+    env={"BIGQUERY_PROJECT": gcloud_bq_project}
 )
 
 class schemaLinkingAgent(dspy.Signature):
