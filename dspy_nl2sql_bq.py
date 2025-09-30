@@ -1,17 +1,19 @@
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
-
+from typing import List, Optional, Dict
 import os
 import dspy
 import mlflow
+import pydantic
 
+# Load environment variables
 load_dotenv()
-
 anthropic_api_key = os.getenv('anthropic_api_key')
 gcloud_toolbox = os.getenv('gcloud_toolbox')
 gcloud_bq_project = os.getenv('gcloud_bq_project')
 
+# MLflow configuration
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("DSPy")
 mlflow.dspy.autolog()
@@ -23,69 +25,94 @@ server_params = StdioServerParameters(
     env={"BIGQUERY_PROJECT": gcloud_bq_project}
 )
 
-class schemaLinkingAgent(dspy.Signature):
-    """You are a Schema Linking Agent who parses the natural language question in conjunction with the database schema to identify the relevant tables and columns
-required for answering the query. In addition, you extract structural information such as primary keys,
-foreign keys, and join relationships. You do not create or run SQL queries at this stage. You do not create a 
-query strategy."""
+# LM Configuration
+lm = dspy.LM('anthropic/claude-sonnet-4-20250514', 
+             api_key=anthropic_api_key,
+             temperature=0.0)
+dspy.configure(lm=lm)
 
-    user_request: str = dspy.InputField()
-    process_result: str = dspy.OutputField(
-        desc=(
-            "Forms the foundation for subsequent steps by constraining SQL generation to schema-relevant entities." \
-            "Your output should be a concise technical summary of the relevant schema elements and their relationships."
-        )
+#-------------------------------#
+#     1. Models (Pydantic)      #
+#-------------------------------#
+class joinSpec(pydantic.BaseModel):
+    left: str
+    right: str
+    on: str
+    type: str | None = pydantic.Field(default=None, description="join type if relevant")
+
+class dbSchema(pydantic.BaseModel):
+    tables: Dict[str, List[str]]
+    primary_keys: Dict[str, str]
+    columns: List[str]
+    joins: List[joinSpec] = []
+
+class subProblem(pydantic.BaseModel):
+    clause: str = pydantic.Field(
+        description="SQL clause name like WHERE, GROUP BY, HAVING, ORDER BY"
     )
+    goal: str = pydantic.Field(description="What this clause should accomplish")
+
+class decomposition(pydantic.BaseModel):
+    subproblems: List[subProblem] = pydantic.Field(
+        description="List of subproblems with clause and goal"
+    )
+
+class queryPlan(pydantic.BaseModel):
+    steps: List[str] = pydantic.Field(description="Step-by-step plan to generate the query")
+    aggregations: List[str] = pydantic.Field(description="List of aggregations to be used")
+    filters: List[str] = pydantic.Field(description="List of filters to be applied")
+    group_bys: List[str] = pydantic.Field(description="List of GROUP BY clauses to be used")
+    order_bys: List[str] = pydantic.Field(description="List of ORDER BY clauses to be used")
+
+
+#-------------------------------#
+#      2. DSPy Signatures       #
+#-------------------------------#
+class schemaLinkingAgent(dspy.Signature):
+    """Identify relevant tables/columns/joins for the question.
+    Return STRICT structured JSON as dbSchema."""
+
+    question: str = dspy.InputField()
+    schemaLink: dbSchema = dspy.OutputField(
+        desc=("relevant schema elements")
+    )
+    rationale: str = dspy.OutputField()
 
 class subproblemLinkingAgent(dspy.Signature):
     """You are a Subproblem Agent. Given the user request and the schema info, you decomposes the query into clause-level 
     subproblems (e.g., WHERE, GROUP BY, JOIN, DISTINCT, ORDER BY, HAVING, EXCEPT, LIMIT, UNION)."""
 
-    schema_info: str = dspy.InputField()
-    user_request: str = dspy.InputField()
-    process_result: str = dspy.OutputField(
-        desc=(
-            "Each identified clause is expressed as a key/value pair in a structured JSON object, where the key "
-            "is the clause type and the value is the partially completed clause expression. This decomposition "
-            "provides a modular representation of the query intent, enabling downstream agents to reason over "
-            "smaller, well-defined units."
-        )
-    )
+    question: str = dspy.InputField()
+    schemaLink: dbSchema = dspy.InputField()
+    subProblems: subProblem = dspy.OutputField()
 
 class queryPlanAgent(dspy.Signature):
     """You are a Query Plan Agent. Given the user request, schema info, and subproblems, you create a step-by-step query plan 
     that will be used to solve the user's request. You produce only the procedural plan and are explicitly restricted from generating 
     executable SQL at this stage."""
     
-    schema_info: str = dspy.InputField()
-    user_request: str = dspy.InputField()
-    sub_problems: str = dspy.InputField()
-    process_result: str = dspy.OutputField(
-        desc=(
-            "A step-by-step execution plan that maps the user’s intent to the schema and subproblems"
-        )
-    )
+    question: str = dspy.InputField()
+    schemaLink: dbSchema = dspy.InputField()
+    subProblems: subProblem = dspy.InputField()
+    plan: queryPlan = dspy.OutputField()
 
 class sqlQueryAgent(dspy.Signature):
-    """You are a SQL Query Agent. Given the user request, schema info, subproblems, and query plan, you generate the final executable SQL query.
-    Remove extraneous artifacts such as trailing semicolons or natural language fragments, ensuring the query is syntactically valid."""
+    """You are a SQL Query Agent. Given the user request, schema info, subproblems, and query plan, you generate the final executable SQL query."""
     
-    schema_info: str = dspy.InputField()
-    user_request: str = dspy.InputField()
-    sub_problems: str = dspy.InputField()
-    query_plan: str = dspy.InputField()
-    process_result: str = dspy.OutputField(
+    question: str = dspy.InputField()
+    schemaLink: dbSchema = dspy.InputField()
+    subProblems: subProblem = dspy.InputField()
+    plan: queryPlan = dspy.InputField()
+    sql: str = dspy.OutputField(
         desc=(
             "The final executable SQL query that accurately reflects the user's intent as outlined in the query plan."
         )
     )
 
-lm = dspy.LM('anthropic/claude-sonnet-4-20250514', 
-             api_key=anthropic_api_key,
-             temperature=0.0)
-dspy.configure(lm=lm)
-
-async def run(user_request):
+#-------------------------------#
+#    3. TextToSQL Pipeline      #
+#-------------------------------#
+async def run(question):
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             # Initialize the connection
@@ -99,16 +126,16 @@ async def run(user_request):
                 dspy_tools.append(dspy.Tool.from_mcp_tool(session, tool))
 
             schemaAgent = dspy.ReAct(schemaLinkingAgent, tools=dspy_tools)
-            schemaInfo = await schemaAgent.acall(user_request=user_request)
+            schemaInfo = await schemaAgent.acall(question=question)
 
             subproblemAgent = dspy.Predict(subproblemLinkingAgent)
-            subproblems = await subproblemAgent.acall(schema_info=schemaInfo.process_result, user_request=user_request)
+            subproblems = await subproblemAgent.acall(schemaLink=schemaInfo.schemaLink, question=question)
 
             planAgent = dspy.ChainOfThought(queryPlanAgent)
-            queryPlan = await planAgent.acall(schema_info=schemaInfo.process_result, user_request=user_request, sub_problems=subproblems.process_result)
+            queryPlan = await planAgent.acall(schemaLink=schemaInfo.schemaLink, question=question, subProblems=subproblems.subProblems)
 
             sqlAgent = dspy.ChainOfThought(sqlQueryAgent)
-            sqlQuery = await sqlAgent.acall(schema_info=schemaInfo.process_result, user_request=user_request, sub_problems=subproblems.process_result, query_plan=queryPlan.process_result)
+            sqlQuery = await sqlAgent.acall(schemaLink=schemaInfo.schemaLink, question=question, subProblems=subproblems.subProblems, plan=queryPlan.plan)
 
 if __name__ == "__main__":
     import asyncio
