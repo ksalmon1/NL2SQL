@@ -26,7 +26,7 @@ server_params = StdioServerParameters(
 )
 
 # LM Configuration
-lm = dspy.LM('anthropic/claude-sonnet-4-20250514', 
+lm = dspy.LM('claude-sonnet-4-5-20250929', 
              api_key=anthropic_api_key,
              temperature=0.0)
 dspy.configure(lm=lm)
@@ -73,10 +73,7 @@ class schemaLinkingAgent(dspy.Signature):
     Return STRICT structured JSON as dbSchema."""
 
     question: str = dspy.InputField()
-    schemaLink: dbSchema = dspy.OutputField(
-        desc=("relevant schema elements")
-    )
-    rationale: str = dspy.OutputField()
+    schemaLink: dbSchema = dspy.OutputField()
 
 class subproblemLinkingAgent(dspy.Signature):
     """You are a Subproblem Agent. Given the user request and the schema info, you decomposes the query into clause-level 
@@ -84,24 +81,25 @@ class subproblemLinkingAgent(dspy.Signature):
 
     question: str = dspy.InputField()
     schemaLink: dbSchema = dspy.InputField()
-    subProblems: subProblem = dspy.OutputField()
+    subProblems: decomposition = dspy.OutputField()
 
 class queryPlanAgent(dspy.Signature):
-    """You are a Query Plan Agent. Given the user request, schema info, and subproblems, you create a step-by-step query plan 
-    that will be used to solve the user's request. You produce only the procedural plan and are explicitly restricted from generating 
+    """You are a BigQuery SQL Planning Agent. Given the user request, schema info, and subproblems, you create a step-by-step plan 
+    to construct a query that will be used to solve the user's request. You produce only the procedural plan and are explicitly restricted from generating 
     executable SQL at this stage."""
     
     question: str = dspy.InputField()
     schemaLink: dbSchema = dspy.InputField()
-    subProblems: subProblem = dspy.InputField()
+    subProblems: decomposition = dspy.InputField()
     plan: queryPlan = dspy.OutputField()
 
 class sqlQueryAgent(dspy.Signature):
-    """You are a SQL Query Agent. Given the user request, schema info, subproblems, and query plan, you generate the final executable SQL query."""
+    """You are a SQL Query Agent. Given the user request, schema info, subproblems, and query plan, you generate the final executable SQL query.
+    The SQL query must be valid and compatible with Google BigQuery syntax and should accurately reflect the user's intent as outlined in the query plan."""
     
     question: str = dspy.InputField()
     schemaLink: dbSchema = dspy.InputField()
-    subProblems: subProblem = dspy.InputField()
+    subProblems: decomposition = dspy.InputField()
     plan: queryPlan = dspy.InputField()
     sql: str = dspy.OutputField(
         desc=(
@@ -112,7 +110,7 @@ class sqlQueryAgent(dspy.Signature):
 #-------------------------------#
 #    3. TextToSQL Pipeline      #
 #-------------------------------#
-async def run(question):
+async def Main(question):
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             # Initialize the connection
@@ -140,4 +138,4 @@ async def run(question):
 if __name__ == "__main__":
     import asyncio
 
-    asyncio.run(run("Please help me find github repos related to finance, their license type, and last commmit message."))
+    asyncio.run(Main("Please help me find github repos related to finance, their license type, and last commmit message."))
