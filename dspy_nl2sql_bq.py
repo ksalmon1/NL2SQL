@@ -31,9 +31,31 @@ lm = dspy.LM('claude-sonnet-4-5-20250929',
              temperature=0.0)
 dspy.configure(lm=lm)
 
-#-------------------------------#
-#     1. Models (Pydantic)      #
-#-------------------------------#
+RULES = [
+    "Use CTEs for complex queries",
+    "Use table aliases to shorten table names",
+    "Use column aliases for computed columns",
+    "Only use SQL features supported by the target dialect (given in schema)",
+    "Always use explicit JOINs instead of WHERE-based joins",
+    "Always use fully qualified column names (table.column)",
+    "Ensure the SQL is syntactically correct",
+    "Ensure the SQL is semantically correct (e.g. GROUP BY columns)",
+    "Ensure the SQL addresses all subtasks in the decomposition",
+    "Ensure the SQL is safe against SQL injection (e.g. no direct string interpolation)",
+    "Ensure the SQL returns correct results for the question",
+    "Ensure the SQL is efficient and scalable (e.g. avoid SELECT *)",
+    "Ensure the SQL uses appropriate indexing (e.g. WHERE clauses on indexed columns)",
+    "Ensure the SQL uses appropriate aggregation functions (e.g. COUNT, SUM, AVG)",
+    "Ensure the SQL uses appropriate filtering (e.g. WHERE, HAVING)",
+    "Ensure the SQL uses appropriate sorting (e.g. ORDER BY)",
+    "Ensure the SQL uses appropriate grouping (e.g. GROUP BY)",
+    "Ensure the SQL uses appropriate joins (e.g. INNER JOIN, LEFT JOIN)",
+    "When you use a WHERE caluse, use `WHERE 1 = 1` as the first condition to make appending conditions easier. Subsequent conditions should use AND/OR on a new row.",
+]
+
+#==============================#
+#  ----  1. Data Models   ---- #
+#==============================#
 class joinSpec(pydantic.BaseModel):
     left: str
     right: str
@@ -43,7 +65,9 @@ class joinSpec(pydantic.BaseModel):
 class dbSchema(pydantic.BaseModel):
     tables: Dict[str, List[str]]
     primary_keys: Dict[str, str]
-    columns: List[str]
+    columns: Dict[str, str] = pydantic.Field(
+        description="The column names and their respective data types (e.g., INT, VARCHAR, DATE)"
+    )
     joins: List[joinSpec] = []
 
 class subProblem(pydantic.BaseModel):
@@ -64,13 +88,18 @@ class queryPlan(pydantic.BaseModel):
     group_bys: List[str] = pydantic.Field(description="List of GROUP BY clauses to be used")
     order_bys: List[str] = pydantic.Field(description="List of ORDER BY clauses to be used")
 
+class correctionPlan(pydantic.BaseModel):
+    errors: List[str] = pydantic.Field()
+    corrections: List[str] = pydantic.Field()
 
-#-------------------------------#
-#      2. DSPy Signatures       #
-#-------------------------------#
+
+#==============================#
+# ---  2. DSPy Signatures ---  #
+#==============================#
 class schemaLinkingAgent(dspy.Signature):
     """Identify relevant tables/columns/joins for the question.
-    Return STRICT structured JSON as dbSchema."""
+    Return STRICT structured JSON as dbSchema.
+    Tables must be qualified with a dataset (e.g. dataset.table)"""
 
     question: str = dspy.InputField()
     schemaLink: dbSchema = dspy.OutputField()
@@ -95,21 +124,46 @@ class queryPlanAgent(dspy.Signature):
 
 class sqlQueryAgent(dspy.Signature):
     """You are a SQL Query Agent. Given the user request, schema info, subproblems, and query plan, you generate the final executable SQL query.
-    The SQL query must be valid and compatible with Google BigQuery syntax and should accurately reflect the user's intent as outlined in the query plan."""
+    The SQL query must be valid and compatible with Google BigQuery syntax and should accurately reflect the user's intent as outlined in the query plan.
+    You must adhere to the provided rules to ensure the SQL is efficient, safe, and correct."""
     
     question: str = dspy.InputField()
     schemaLink: dbSchema = dspy.InputField()
     subProblems: decomposition = dspy.InputField()
     plan: queryPlan = dspy.InputField()
+    rules: List[str] = dspy.InputField()
     sql: str = dspy.OutputField(
         desc=(
-            "The final executable SQL query that accurately reflects the user's intent as outlined in the query plan."
+            "The final executable SQL query that accurately reflects the user's intent as outlined in the query plan." \
+            "In markdown format with SQL syntax highlighting."
         )
     )
 
-#-------------------------------#
-#    3. TextToSQL Pipeline      #
-#-------------------------------#
+class executeSQLAgent(dspy.Signature):
+    """You are a SQL Execution Agent. Given an executable SQL query, you execute it against the connected database and return the results.
+    Ensure that the execution is safe and does not compromise the integrity of the database.
+    ***Dry run only.***"""
+
+    sql: str = dspy.InputField()
+    results: List[Dict[str, str]] = dspy.OutputField(
+        desc="The results of executing the SQL query, formatted as a list of dictionaries where each dictionary represents a row with column names as keys."
+    )
+    errors: Optional[List[str]] = dspy.OutputField(
+        desc="Any errors encountered during SQL execution, or null if execution was successful."
+    )
+
+class sqlCorrectionAgent(dspy.Signature):
+    """You are a SQL Correction Agent. Given an SQL query and any errors encountered during its execution, you analyze the errors and provide corrections.
+    Your goal is to refine the SQL query to ensure it executes successfully and meets the user's original intent.
+    You ONLY return the correction plan. You do not execute the corrected SQL."""
+
+    sql: str = dspy.InputField()
+    errors: List[str] = dspy.InputField()
+    correctPlan: correctionPlan = dspy.OutputField()
+
+#===============================#
+# --- 3. TextToSQL Pipeline --- #
+#===============================#
 async def Main(question):
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -132,8 +186,23 @@ async def Main(question):
             planAgent = dspy.ChainOfThought(queryPlanAgent)
             queryPlan = await planAgent.acall(schemaLink=schemaInfo.schemaLink, question=question, subProblems=subproblems.subProblems)
 
-            sqlAgent = dspy.ChainOfThought(sqlQueryAgent)
-            sqlQuery = await sqlAgent.acall(schemaLink=schemaInfo.schemaLink, question=question, subProblems=subproblems.subProblems, plan=queryPlan.plan)
+            sqlAgent = dspy.Predict(sqlQueryAgent)
+            sqlQuery = await sqlAgent.acall(
+                schemaLink=schemaInfo.schemaLink,
+                question=question,
+                subProblems=subproblems.subProblems,
+                rules=RULES,
+                plan=queryPlan.plan
+            )
+
+            errors = []
+            executeAgent = dspy.ReAct(executeSQLAgent, tools=dspy_tools)
+            execution = await executeAgent.acall(sql=sqlQuery.sql)
+            errors.append(execution.errors)
+            print("errors:", errors)
+
+            correctionAgent = dspy.ReAct(sqlCorrectionAgent, tools=dspy_tools)
+            correction = await correctionAgent.acall(sql=sqlQuery.sql, errors=errors)
 
 if __name__ == "__main__":
     import asyncio
