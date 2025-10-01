@@ -7,6 +7,10 @@ import dspy
 import mlflow
 import pydantic
 
+from db_schema_example import example_json_schema
+
+db_schema = example_json_schema()
+
 # Load environment variables
 load_dotenv()
 anthropic_api_key = os.getenv('anthropic_api_key')
@@ -102,6 +106,7 @@ class schemaLinkingAgent(dspy.Signature):
     Tables must be qualified with a dataset (e.g. dataset.table)"""
 
     question: str = dspy.InputField()
+    db_schema: str = dspy.InputField()
     schemaLink: dbSchema = dspy.OutputField()
 
 class subproblemLinkingAgent(dspy.Signature):
@@ -148,11 +153,11 @@ class executeSQLAgent(dspy.Signature):
     results: List[Dict[str, str]] = dspy.OutputField(
         desc="The results of executing the SQL query, formatted as a list of dictionaries where each dictionary represents a row with column names as keys."
     )
-    errors: Optional[List[str]] = dspy.OutputField(
+    errors: List[str] = dspy.OutputField(
         desc="Any errors encountered during SQL execution, or null if execution was successful."
     )
 
-class sqlCorrectionAgent(dspy.Signature):
+class sqlCorrectionPlanAgent(dspy.Signature):
     """You are a SQL Correction Agent. Given an SQL query and any errors encountered during its execution, you analyze the errors and provide corrections.
     Your goal is to refine the SQL query to ensure it executes successfully and meets the user's original intent.
     You ONLY return the correction plan. You do not execute the corrected SQL."""
@@ -160,6 +165,17 @@ class sqlCorrectionAgent(dspy.Signature):
     sql: str = dspy.InputField()
     errors: List[str] = dspy.InputField()
     correctPlan: correctionPlan = dspy.OutputField()
+
+class sqlCorrectionAgent(dspy.Signature):
+    """You are a SQL Correction Agent. Given an SQL query and a correction plan, you apply the corrections to the SQL query.
+    Your goal is to produce a revised SQL query that addresses the issues identified in the correction plan and is ready for execution.
+    You ONLY return the corrected SQL. You do not execute the corrected SQL."""
+
+    sql: str = dspy.InputField()
+    correctPlan: correctionPlan = dspy.InputField()
+    correctedSQL: str = dspy.OutputField(
+        desc="The revised SQL query that incorporates the corrections outlined in the correction plan."
+    )
 
 #===============================#
 # --- 3. TextToSQL Pipeline --- #
@@ -177,8 +193,10 @@ async def Main(question):
             for tool in tools.tools:
                 dspy_tools.append(dspy.Tool.from_mcp_tool(session, tool))
 
-            schemaAgent = dspy.ReAct(schemaLinkingAgent, tools=dspy_tools)
-            schemaInfo = await schemaAgent.acall(question=question)
+            #schemaAgent = dspy.ReAct(schemaLinkingAgent, tools=dspy_tools)
+            # Use ReAct for shcema linking using tools
+            schemaAgent = dspy.Predict(schemaLinkingAgent)
+            schemaInfo = await schemaAgent.acall(question=question, db_schema=db_schema)
 
             subproblemAgent = dspy.Predict(subproblemLinkingAgent)
             subproblems = await subproblemAgent.acall(schemaLink=schemaInfo.schemaLink, question=question)
@@ -195,16 +213,24 @@ async def Main(question):
                 plan=queryPlan.plan
             )
 
-            errors = []
-            executeAgent = dspy.ReAct(executeSQLAgent, tools=dspy_tools)
-            execution = await executeAgent.acall(sql=sqlQuery.sql)
-            errors.append(execution.errors)
-            print("errors:", errors)
+            sqlRunAgent = dspy.ReAct(executeSQLAgent, tools=dspy_tools)
+            execution = await sqlRunAgent.acall(sql=sqlQuery.sql)
+            
+            if execution.errors:
+                print(" --- Errors detected. Attempting SQL correction... ---")
+                correctionPlanAgent = dspy.ReAct(sqlCorrectionPlanAgent, tools=dspy_tools)
+                correction = await correctionPlanAgent.acall(sql=sqlQuery.sql, errors=execution.errors)
 
-            correctionAgent = dspy.ReAct(sqlCorrectionAgent, tools=dspy_tools)
-            correction = await correctionAgent.acall(sql=sqlQuery.sql, errors=errors)
+                correctionAgent = dspy.Predict(sqlCorrectionAgent)
+                correctedSQL = await correctionAgent.acall(sql=sqlQuery.sql, correctPlan=correction.correctPlan)
+                print("Corrected SQL: ", correctedSQL.correctedSQL)
+            else:
+                print("SQL Results: ", sqlQuery.sql)
+
 
 if __name__ == "__main__":
     import asyncio
 
+    # Please help me find github repos related to finance, their license type, and last commmit message.
+    # Please help me find all github repos.
     asyncio.run(Main("Please help me find github repos related to finance, their license type, and last commmit message."))
