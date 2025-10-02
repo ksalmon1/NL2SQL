@@ -6,6 +6,8 @@ import os
 import dspy
 import mlflow
 import pydantic
+import asyncio
+import json
 
 from db_schema_example import example_json_schema
 
@@ -56,6 +58,23 @@ RULES = [
     "Ensure the SQL uses appropriate joins (e.g. INNER JOIN, LEFT JOIN)",
     "When you use a WHERE caluse, use `WHERE 1 = 1` as the first condition to make appending conditions easier. Subsequent conditions should use AND/OR on a new row.",
 ]
+
+#==============================#
+#  ----  Gather MCP Tools ---- #
+#==============================#
+async def Tools():
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            # Initialize the connection
+            await session.initialize()
+            # List available tools
+            tools = await session.list_tools()
+
+            # Convert MCP tools to DSPy tools
+            dspy_tools = []
+            for tool in tools.tools:
+                dspy_tools.append(dspy.Tool.from_mcp_tool(session, tool))
+            return dspy_tools
 
 #==============================#
 #  ----  1. Data Models   ---- #
@@ -180,57 +199,70 @@ class sqlCorrectionAgent(dspy.Signature):
 #===============================#
 # --- 3. TextToSQL Pipeline --- #
 #===============================#
-async def Main(question):
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            # Initialize the connection
-            await session.initialize()
-            # List available tools
-            tools = await session.list_tools()
 
-            # Convert MCP tools to DSPy tools
-            dspy_tools = []
-            for tool in tools.tools:
-                dspy_tools.append(dspy.Tool.from_mcp_tool(session, tool))
+class SQLOfThought(dspy.Module):
+    def __init__(self, tools):
+        super().__init__()
 
-            #schemaAgent = dspy.ReAct(schemaLinkingAgent, tools=dspy_tools)
-            # Use ReAct for shcema linking using tools
-            schemaAgent = dspy.Predict(schemaLinkingAgent)
-            schemaInfo = await schemaAgent.acall(question=question, db_schema=db_schema)
+        self.schemaAgent = dspy.Predict(schemaLinkingAgent)
+        self.subproblemAgent = dspy.Predict(subproblemLinkingAgent)
+        self.planAgent = dspy.ChainOfThought(queryPlanAgent)
+        self.sqlAgent = dspy.Predict(sqlQueryAgent)
+        self.sqlRunAgent = dspy.ReAct(executeSQLAgent, tools)
+        self.correctionPlanAgent = dspy.ReAct(sqlCorrectionPlanAgent, tools)
+        self.correctionAgent = dspy.Predict(sqlCorrectionAgent)
 
-            subproblemAgent = dspy.Predict(subproblemLinkingAgent)
-            subproblems = await subproblemAgent.acall(schemaLink=schemaInfo.schemaLink, question=question)
-
-            planAgent = dspy.ChainOfThought(queryPlanAgent)
-            queryPlan = await planAgent.acall(schemaLink=schemaInfo.schemaLink, question=question, subProblems=subproblems.subProblems)
-
-            sqlAgent = dspy.Predict(sqlQueryAgent)
-            sqlQuery = await sqlAgent.acall(
-                schemaLink=schemaInfo.schemaLink,
-                question=question,
-                subProblems=subproblems.subProblems,
-                rules=RULES,
-                plan=queryPlan.plan
+    async def forward(self, question):
+        schemaInfo = await self.schemaAgent.acall(question=question,db_schema=db_schema)
+        
+        subproblems = await self.subproblemAgent.acall(
+            schemaLink=schemaInfo.schemaLink,
+            question=question
+        )
+        
+        queryPlan = await self.planAgent.acall(
+            schemaLink=schemaInfo.schemaLink,
+            question=question,
+            subProblems=subproblems.subProblems
+        )
+        
+        sqlQuery = await self.sqlAgent.acall(
+            schemaLink=schemaInfo.schemaLink,
+            question=question,
+            subProblems=subproblems.subProblems,
+            rules=RULES,
+            plan=queryPlan.plan
+        )
+        execution = await self.sqlRunAgent.acall(
+            sql=sqlQuery.sql
             )
+                
+        if execution.errors:
+            print(" --- Errors detected. Attempting SQL correction... ---")
+            correction = await self.correctionPlanAgent.acall(
+                sql=sqlQuery.sql,
+                errors=execution.errors
+                )
 
-            sqlRunAgent = dspy.ReAct(executeSQLAgent, tools=dspy_tools)
-            execution = await sqlRunAgent.acall(sql=sqlQuery.sql)
-            
-            if execution.errors:
-                print(" --- Errors detected. Attempting SQL correction... ---")
-                correctionPlanAgent = dspy.ReAct(sqlCorrectionPlanAgent, tools=dspy_tools)
-                correction = await correctionPlanAgent.acall(sql=sqlQuery.sql, errors=execution.errors)
+            correctedSQL = await self.correctionAgent.acall(
+                sql=sqlQuery.sql,
+                correctPlan=correction.correctPlan
+            )
+            print("Corrected SQL: ", correctedSQL.correctedSQL)
+        else:
+            print("SQL Results: ", sqlQuery.sql)
 
-                correctionAgent = dspy.Predict(sqlCorrectionAgent)
-                correctedSQL = await correctionAgent.acall(sql=sqlQuery.sql, correctPlan=correction.correctPlan)
-                print("Corrected SQL: ", correctedSQL.correctedSQL)
-            else:
-                print("SQL Results: ", sqlQuery.sql)
 
+async def main():
+    dspy_tools = await Tools()
+
+    question = input("Enter your question: ")
+
+    sql_of_thought = SQLOfThought(dspy_tools)
+    await sql_of_thought(question=question)
 
 if __name__ == "__main__":
-    import asyncio
+    asyncio.run(main())
 
     # Please help me find github repos related to finance, their license type, and last commmit message.
     # Please help me find all github repos.
-    asyncio.run(Main("Please help me find github repos related to finance, their license type, and last commmit message."))
