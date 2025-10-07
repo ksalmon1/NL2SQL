@@ -1,11 +1,12 @@
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPIError
 from dotenv import load_dotenv
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import os
 import dspy
 import mlflow
 import pydantic
+import json
 
 from db_schema_example import example_json_schema
 
@@ -14,20 +15,18 @@ db_schema = example_json_schema()
 # Load environment variables
 load_dotenv()
 anthropic_api_key = os.getenv('anthropic_api_key')
-gcloud_toolbox = os.getenv('gcloud_toolbox')
 gcloud_bq_project = os.getenv('gcloud_bq_project')
 
 # MLflow configuration
-mlflow.set_tracking_uri("http://localhost:5000")
-mlflow.set_experiment("DSPy")
 mlflow.dspy.autolog()
 
-# Create server parameters for stdio connection
-server_params = StdioServerParameters( 
-    command=gcloud_toolbox,
-    args=["--prebuilt","bigquery","--stdio"],
-    env={"BIGQUERY_PROJECT": gcloud_bq_project}
-)
+# Initialize BigQuery client
+try:
+    bq_client = bigquery.Client(project=gcloud_bq_project)
+except Exception as e:
+    print(f"Error initializing BigQuery client: {e}")
+    print("Make sure you have credentials configured (GOOGLE_APPLICATION_CREDENTIALS or gcloud auth)")
+    exit(1)
 
 # LM Configuration
 lm = dspy.LM('claude-sonnet-4-5-20250929', 
@@ -54,47 +53,139 @@ RULES = [
     "Ensure the SQL uses appropriate sorting (e.g. ORDER BY)",
     "Ensure the SQL uses appropriate grouping (e.g. GROUP BY)",
     "Ensure the SQL uses appropriate joins (e.g. INNER JOIN, LEFT JOIN)",
-    "When you use a WHERE caluse, use `WHERE 1 = 1` as the first condition to make appending conditions easier. Subsequent conditions should use AND/OR on a new row.",
+    "When you use a WHERE clause, use `WHERE 1 = 1` as the first condition to make appending conditions easier. Subsequent conditions should use AND/OR on a new row.",
+]
+
+#==============================#
+#  ----  BigQuery Functions --- #
+#==============================#
+def clean_sql(sql: str) -> str:
+    """Remove markdown formatting from SQL if present.
+
+    Args:
+        sql: The SQL query string, potentially with markdown formatting
+
+    Returns:
+        Cleaned SQL string without markdown
+    """
+    sql_clean = sql.strip()
+    if sql_clean.startswith("```sql"):
+        sql_clean = sql_clean.split("```sql")[1].split("```")[0].strip()
+    elif sql_clean.startswith("```"):
+        sql_clean = sql_clean.split("```")[1].split("```")[0].strip()
+    return sql_clean
+
+def dry_run_bigquery(sql: str) -> Dict[str, Any]:
+    """Perform a dry run of a BigQuery SQL query to validate syntax without executing.
+
+    Args:
+        sql: The SQL query to validate
+
+    Returns:
+        Dict containing validation results and any errors
+    """
+    try:
+        sql_clean = clean_sql(sql)
+
+        # Configure dry run
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+
+        # Execute dry run
+        query_job = bq_client.query(sql_clean, job_config=job_config)
+
+        return {
+            "valid": True,
+            "message": "Query is valid.",
+            "errors": []
+        }
+    except GoogleAPIError as e:
+        return {
+            "valid": False,
+            "message": f"Query validation failed: {str(e)}",
+            "errors": [str(e)]
+        }
+    except Exception as e:
+        return {
+            "valid": False,
+            "message": f"Unexpected error: {str(e)}",
+            "errors": [f"Unexpected error: {str(e)}"]
+        }
+
+def get_table_schema(dataset_id: str, table_id: str) -> Dict[str, Any]:
+    """Get schema information for a BigQuery table.
+
+    Args:
+        dataset_id: The dataset ID
+        table_id: The table ID
+
+    Returns:
+        Dict containing table schema information
+    """
+    try:
+        table_ref = f"{gcloud_bq_project}.{dataset_id}.{table_id}"
+        table = bq_client.get_table(table_ref)
+
+        schema_info = {
+            "columns": {},
+            "description": table.description or ""
+        }
+
+        for field in table.schema:
+            schema_info["columns"][field.name] = field.field_type
+
+        return schema_info
+    except Exception as e:
+        return {"error": str(e)}
+
+# Create DSPy tools from BigQuery functions
+bigquery_tools = [
+    dspy.Tool(
+        dry_run_bigquery,
+        name="dry_run_bigquery",
+        desc="Validate a SQL query with BigQuery dry run to check syntax and estimate costs without executing"
+    ),
+    dspy.Tool(
+        get_table_schema,
+        name="get_table_schema",
+        desc="Get schema information for a specific BigQuery table"
+    )
 ]
 
 #==============================#
 #  ----  1. Data Models   ---- #
 #==============================#
-class joinSpec(pydantic.BaseModel):
+class JoinSpec(pydantic.BaseModel):
     left: str
     right: str
     on: str
     type: str | None = pydantic.Field(default=None, description="join type if relevant")
 
-class dbSchema(pydantic.BaseModel):
+class DbSchema(pydantic.BaseModel):
     tables: Dict[str, List[str]]
     primary_keys: Dict[str, str]
     columns: Dict[str, str] = pydantic.Field(
         description="The column names and their respective data types (e.g., INT, VARCHAR, DATE)"
     )
-    joins: List[joinSpec] = []
+    joins: List[JoinSpec] = []
 
-class subProblem(pydantic.BaseModel):
+class SubProblem(pydantic.BaseModel):
     clause: str = pydantic.Field(
         description="SQL clause name like WHERE, GROUP BY, HAVING, ORDER BY"
     )
     goal: str = pydantic.Field(description="What this clause should accomplish")
 
-class decomposition(pydantic.BaseModel):
-    subproblems: List[subProblem] = pydantic.Field(
+class Decomposition(pydantic.BaseModel):
+    subproblems: List[SubProblem] = pydantic.Field(
         description="List of subproblems with clause and goal"
     )
 
-class queryPlan(pydantic.BaseModel):
+class QueryPlan(pydantic.BaseModel):
     steps: List[str] = pydantic.Field(description="Step-by-step plan to generate the query")
     aggregations: List[str] = pydantic.Field(description="List of aggregations to be used")
     filters: List[str] = pydantic.Field(description="List of filters to be applied")
     group_bys: List[str] = pydantic.Field(description="List of GROUP BY clauses to be used")
     order_bys: List[str] = pydantic.Field(description="List of ORDER BY clauses to be used")
 
-class correctionPlan(pydantic.BaseModel):
-    errors: List[str] = pydantic.Field()
-    corrections: List[str] = pydantic.Field()
 
 
 #==============================#
@@ -102,40 +193,40 @@ class correctionPlan(pydantic.BaseModel):
 #==============================#
 class schemaLinkingAgent(dspy.Signature):
     """Identify relevant tables/columns/joins for the question.
-    Return STRICT structured JSON as dbSchema.
+    Return STRICT structured JSON as DbSchema.
     Tables must be qualified with a dataset (e.g. dataset.table)"""
 
     question: str = dspy.InputField()
     db_schema: str = dspy.InputField()
-    schemaLink: dbSchema = dspy.OutputField()
+    schemaLink: DbSchema = dspy.OutputField()
 
 class subproblemLinkingAgent(dspy.Signature):
-    """You are a Subproblem Agent. Given the user request and the schema info, you decomposes the query into clause-level 
+    """You are a Subproblem Agent. Given the user request and the schema info, you decomposes the query into clause-level
     subproblems (e.g., WHERE, GROUP BY, JOIN, DISTINCT, ORDER BY, HAVING, EXCEPT, LIMIT, UNION)."""
 
     question: str = dspy.InputField()
-    schemaLink: dbSchema = dspy.InputField()
-    subProblems: decomposition = dspy.OutputField()
+    schemaLink: DbSchema = dspy.InputField()
+    subProblems: Decomposition = dspy.OutputField()
 
 class queryPlanAgent(dspy.Signature):
-    """You are a BigQuery SQL Planning Agent. Given the user request, schema info, and subproblems, you create a step-by-step plan 
-    to construct a query that will be used to solve the user's request. You produce only the procedural plan and are explicitly restricted from generating 
+    """You are a BigQuery SQL Planning Agent. Given the user request, schema info, and subproblems, you create a step-by-step plan
+    to construct a query that will be used to solve the user's request. You produce only the procedural plan and are explicitly restricted from generating
     executable SQL at this stage."""
-    
+
     question: str = dspy.InputField()
-    schemaLink: dbSchema = dspy.InputField()
-    subProblems: decomposition = dspy.InputField()
-    plan: queryPlan = dspy.OutputField()
+    schemaLink: DbSchema = dspy.InputField()
+    subProblems: Decomposition = dspy.InputField()
+    plan: QueryPlan = dspy.OutputField()
 
 class sqlQueryAgent(dspy.Signature):
     """You are a SQL Query Agent. Given the user request, schema info, subproblems, and query plan, you generate the final executable SQL query.
     The SQL query must be valid and compatible with Google BigQuery syntax and should accurately reflect the user's intent as outlined in the query plan.
     You must adhere to the provided rules to ensure the SQL is efficient, safe, and correct."""
-    
+
     question: str = dspy.InputField()
-    schemaLink: dbSchema = dspy.InputField()
-    subProblems: decomposition = dspy.InputField()
-    plan: queryPlan = dspy.InputField()
+    schemaLink: DbSchema = dspy.InputField()
+    subProblems: Decomposition = dspy.InputField()
+    plan: QueryPlan = dspy.InputField()
     rules: List[str] = dspy.InputField()
     sql: str = dspy.OutputField(
         desc=(
@@ -144,93 +235,106 @@ class sqlQueryAgent(dspy.Signature):
         )
     )
 
-class executeSQLAgent(dspy.Signature):
-    """You are a SQL Execution Agent. Given an executable SQL query, you execute it against the connected database and return the results.
-    Ensure that the execution is safe and does not compromise the integrity of the database.
-    ***Dry run only.***"""
-
-    sql: str = dspy.InputField()
-    results: List[Dict[str, str]] = dspy.OutputField(
-        desc="The results of executing the SQL query, formatted as a list of dictionaries where each dictionary represents a row with column names as keys."
-    )
-    errors: List[str] = dspy.OutputField(
-        desc="Any errors encountered during SQL execution, or null if execution was successful."
-    )
-
-class sqlCorrectionPlanAgent(dspy.Signature):
-    """You are a SQL Correction Agent. Given an SQL query and any errors encountered during its execution, you analyze the errors and provide corrections.
-    Your goal is to refine the SQL query to ensure it executes successfully and meets the user's original intent.
-    You ONLY return the correction plan. You do not execute the corrected SQL."""
+class sqlCorrectionAgent(dspy.Signature):
+    """You are a SQL Correction Agent. Given an SQL query and errors encountered during validation, you analyze the errors and produce a corrected SQL query.
+    Your goal is to fix the SQL so it executes successfully and meets the user's original intent.
+    You may use the dry_run_bigquery tool to validate your corrections before returning the final SQL."""
 
     sql: str = dspy.InputField()
     errors: List[str] = dspy.InputField()
-    correctPlan: correctionPlan = dspy.OutputField()
-
-class sqlCorrectionAgent(dspy.Signature):
-    """You are a SQL Correction Agent. Given an SQL query and a correction plan, you apply the corrections to the SQL query.
-    Your goal is to produce a revised SQL query that addresses the issues identified in the correction plan and is ready for execution.
-    You ONLY return the corrected SQL. You do not execute the corrected SQL."""
-
-    sql: str = dspy.InputField()
-    correctPlan: correctionPlan = dspy.InputField()
     correctedSQL: str = dspy.OutputField(
-        desc="The revised SQL query that incorporates the corrections outlined in the correction plan."
+        desc="The revised SQL query that fixes all validation errors."
     )
 
 #===============================#
 # --- 3. TextToSQL Pipeline --- #
 #===============================#
-async def Main(question):
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            # Initialize the connection
-            await session.initialize()
-            # List available tools
-            tools = await session.list_tools()
 
-            # Convert MCP tools to DSPy tools
-            dspy_tools = []
-            for tool in tools.tools:
-                dspy_tools.append(dspy.Tool.from_mcp_tool(session, tool))
+class SQLOfThought(dspy.Module):
+    def __init__(self):
+        super().__init__()
 
-            #schemaAgent = dspy.ReAct(schemaLinkingAgent, tools=dspy_tools)
-            # Use ReAct for shcema linking using tools
-            schemaAgent = dspy.Predict(schemaLinkingAgent)
-            schemaInfo = await schemaAgent.acall(question=question, db_schema=db_schema)
+        self.schemaAgent = dspy.Predict(schemaLinkingAgent)
+        self.subproblemAgent = dspy.Predict(subproblemLinkingAgent)
+        self.planAgent = dspy.Predict(queryPlanAgent)
+        self.sqlAgent = dspy.Predict(sqlQueryAgent)
+        self.correctionAgent = dspy.ReAct(sqlCorrectionAgent, bigquery_tools)
 
-            subproblemAgent = dspy.Predict(subproblemLinkingAgent)
-            subproblems = await subproblemAgent.acall(schemaLink=schemaInfo.schemaLink, question=question)
+    def forward(self, question, max_correction_attempts=3):
+        schemaInfo = self.schemaAgent(question=question, db_schema=db_schema)
 
-            planAgent = dspy.ChainOfThought(queryPlanAgent)
-            queryPlan = await planAgent.acall(schemaLink=schemaInfo.schemaLink, question=question, subProblems=subproblems.subProblems)
+        subproblems = self.subproblemAgent(
+            schemaLink=schemaInfo.schemaLink,
+            question=question
+        )
 
-            sqlAgent = dspy.Predict(sqlQueryAgent)
-            sqlQuery = await sqlAgent.acall(
-                schemaLink=schemaInfo.schemaLink,
-                question=question,
-                subProblems=subproblems.subProblems,
-                rules=RULES,
-                plan=queryPlan.plan
+        queryPlan = self.planAgent(
+            schemaLink=schemaInfo.schemaLink,
+            question=question,
+            subProblems=subproblems.subProblems
+        )
+
+        sqlQuery = self.sqlAgent(
+            schemaLink=schemaInfo.schemaLink,
+            question=question,
+            subProblems=subproblems.subProblems,
+            rules=RULES,
+            plan=queryPlan.plan
+        )
+
+        # Direct dry run validation (no LLM call)
+        execution = dry_run_bigquery(sqlQuery.sql)
+
+        # Retry loop for corrections
+        current_sql = sqlQuery.sql
+        attempt = 0
+
+        while execution["errors"] and attempt < max_correction_attempts:
+            attempt += 1
+            print(f"\n--- Errors detected during dry run (attempt {attempt}/{max_correction_attempts}). Attempting SQL correction... ---")
+
+            correctedSQL = self.correctionAgent(
+                sql=current_sql,
+                errors=execution["errors"]
             )
 
-            sqlRunAgent = dspy.ReAct(executeSQLAgent, tools=dspy_tools)
-            execution = await sqlRunAgent.acall(sql=sqlQuery.sql)
-            
-            if execution.errors:
-                print(" --- Errors detected. Attempting SQL correction... ---")
-                correctionPlanAgent = dspy.ReAct(sqlCorrectionPlanAgent, tools=dspy_tools)
-                correction = await correctionPlanAgent.acall(sql=sqlQuery.sql, errors=execution.errors)
+            # Validate corrected SQL (direct function call)
+            print(f"\n--- Validating corrected SQL (attempt {attempt})... ---")
+            execution = dry_run_bigquery(correctedSQL.correctedSQL)
 
-                correctionAgent = dspy.Predict(sqlCorrectionAgent)
-                correctedSQL = await correctionAgent.acall(sql=sqlQuery.sql, correctPlan=correction.correctPlan)
-                print("Corrected SQL: ", correctedSQL.correctedSQL)
-            else:
-                print("SQL Results: ", sqlQuery.sql)
+            current_sql = correctedSQL.correctedSQL
 
+            if not execution["errors"]:
+                print("\n--- Corrected SQL validated successfully ---")
+                print(f"Valid: {execution['valid']}")
+                print(f"Message: {execution['message']}")
+                print("\n--- Corrected SQL ---")
+                print(current_sql)
+                return current_sql
+
+        if execution["errors"]:
+            print(f"\n--- Failed to correct SQL after {max_correction_attempts} attempts ---")
+            print(f"Errors: {execution['errors']}")
+            print("\n--- Final SQL (with errors) ---")
+            print(current_sql)
+            return current_sql
+        else:
+            print("\n--- Dry Run Successful ---")
+            print(f"Valid: {execution['valid']}")
+            print(f"Message: {execution['message']}")
+            print("\n--- Generated SQL ---")
+            print(current_sql)
+            return current_sql
+
+
+def main():
+    sql_of_thought = SQLOfThought()
+
+    question = input("Enter your question: ")
+    sql_of_thought(question=question)
 
 if __name__ == "__main__":
-    import asyncio
+    main()
 
     # Please help me find github repos related to finance, their license type, and last commmit message.
     # Please help me find all github repos.
-    asyncio.run(Main("Please help me find github repos related to finance, their license type, and last commmit message."))
